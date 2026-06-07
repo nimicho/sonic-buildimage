@@ -137,17 +137,24 @@ while /bin/true; do
   done
 
   # Flush neighbor entries with MAC mismatch between kernel and APPL_DB
-  KERNEL_NEIGH=$(ip neigh show | grep -v "fe80" | grep -v "FAILED\|INCOMPLETE" | cut -d ' ' -f 1,3,5 --output-delimiter=',' | tr -d ' ')
+  KERNEL_NEIGH=$(ip neigh show | grep -v "fe80" | grep -v "FAILED\|INCOMPLETE" |  awk '{print $1","$3","$5","$NF}')
   for neigh in $KERNEL_NEIGH; do
         ip="$( cut -d ',' -f 1 <<< "$neigh" )"
         intf="$( cut -d ',' -f 2 <<< "$neigh" )"
         kernel_mac="$( cut -d ',' -f 3 <<< "$neigh" )"
+        kernel_state="$( cut -d ',' -f 4 <<< "$neigh" )"
         appl_db_mac="$(sonic-db-cli APPL_DB hget NEIGH_TABLE:$intf:$ip neigh)"
         if [[ $kernel_mac != $appl_db_mac ]]; then
-            logger -p warning "MAC mismatch for ${ip} on ${intf} - kernel: ${kernel_mac}, APPL_DB: ${appl_db_mac}"
-            ip neigh flush $ip
-            run_with_retry_cmd "mac mismatch ping to $ip" \
-                timeout 0.2 ping -c1 -w1 "$ip" >/dev/null 2>&1
+            if [[ "$kernel_state" == "PERMANENT" && "$ip" == *":"* ]]; then
+                #For statically added (permanent) IPv6 neigh that is just deleted but still captured here(race condition), no need to flush as
+                #it will not be removed. ping will cause a Neighbor Solititation to be initiated and the neigh entry could be stuck/stagnate for ever.
+                logger -p warning "MAC mismatch on PERMANENT Ipv6 neighbor ${ip} on ${intf} - kernel: ${kernel_mac}, APPL_DB: ${appl_db_mac}"
+            else
+                logger -p warning "MAC mismatch for ${ip} on ${intf} - kernel: ${kernel_mac}, APPL_DB: ${appl_db_mac}"
+                ip neigh flush $ip
+                run_with_retry_cmd "mac mismatch ping to $ip" \
+                    timeout 0.2 ping -c1 -w1 "$ip" >/dev/null 2>&1
+            fi
         fi
   done
 
@@ -171,10 +178,14 @@ while /bin/true; do
       #   ndisc6 -q -w 1 -1 <IP 1> <VLAN interface>;
       #   ndisc6 -q -w 1 -1 <IP 2> <VLAN interface>;
       #   ...
-      while read -r ip ifname; do
+      while read -r ip ifname state; do
           [ -z "$ip" ] && continue
-          run_ndisc6_with_retry "$ifname" "$ip"
-      done < <(ip -6 neigh show | grep -v fe80 | grep "$vlan" | awk '{print $1, $3}')
+	  if [[ "$state" == "PERMANENT" ]]; then
+              logger -p warning "skipping ndisc6 refresh for PERMANENT IPv6 neighbor ${ip} on ${ifname}"
+              continue
+          fi
+          run_ndisc6_with_retry "$ifname" "$ip" "$state"
+      done < <(ip -6 neigh show | grep -v fe80 | grep "$vlan" | awk '{print $1, $3, $NF}')
 
       if [[ $SUBTYPE == "dualtor" ]]; then
         # capture all current failed/incomplete IPv6 neighbors in the kernel to avoid situations where new neighbors are learned
